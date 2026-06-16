@@ -8,7 +8,8 @@ SECRET_KEY = os.environ.get(
     "django-insecure-9!^p2zr8m=k$d3v0&xq+1wybho4ag&7lcfu+ej(nti6r%h@m4s",
 )
 
-DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
+_TRUTHY = {"1", "true", "yes", "on"}
+DEBUG = os.environ.get("DJANGO_DEBUG", "1").lower() in _TRUTHY
 
 ALLOWED_HOSTS = [
     host.strip() for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if host.strip()
