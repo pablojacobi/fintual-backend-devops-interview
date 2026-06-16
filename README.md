@@ -41,8 +41,6 @@ docker compose --profile seed run --rm seed
 
 What changed and why → see [DX.md](DX.md).
 
-Seeding writes ~100k posts and ~500k comments. Expect a few minutes.
-
 ## What the API does
 
 | Method | Path | Description |

@@ -32,8 +32,8 @@ No `mise`, no `uv` toolchain, no local Postgres, no `createdb`. Docker is the on
 
 - Based on `python:3.14-slim` (same version the project's `pyproject.toml` requires).
 - Installs `uv` with `pip` rather than copying a multi-stage image, to keep the file standalone and easy to read.
-- Runs `uv sync --frozen` against the committed `uv.lock`, including dev dependencies (`pytest`, `ruff`) so tests and lint work inside the container too.
-- Installs the venv at `/app/.venv` and prepends it to `PATH`, so the final `CMD` is just `python manage.py runserver` — no `uv run` wrapper.
+- Runs `uv sync --frozen --no-install-project` against the committed `uv.lock`, including dev dependencies (`pytest`, `ruff`) so tests and lint work inside the container too. The `--no-install-project` flag tells uv to only resolve third-party deps in the deps-only stage; the project itself is bind-mounted on top and `runserver` finds it via `PYTHONPATH`, so we don't need to re-bake it into the image every time a file changes.
+- Installs the venv at `/venv` (outside of `/app`) and prepends it to `PATH`, so the final `CMD` is just `python manage.py runserver` — no `uv run` wrapper. Putting the venv outside the bind mount is intentional: a named volume at `/app/.venv` would mask the freshly-built venv on rebuilds, forcing `docker compose down -v` to clear stale deps.
 - `runserver` is used (not `gunicorn`) so that Django's `StatReloader` picks up source edits from the bind mount.
 
 ### `docker-compose.yml`
@@ -44,7 +44,7 @@ Three services, two of which you'll actually use:
 - **`web`** — builds from `Dockerfile.dev`, depends on `db` being healthy, bind-mounts the project at `/app` for hot reload, and runs `migrate` + `runserver` on boot.
 - **`seed`** — same image, but only starts under the `seed` profile. It runs `python manage.py seed` and exits. We kept it behind a profile because seeding 600k rows takes minutes and you don't want it on every `up`.
 
-Two named volumes (`web_venv`, `web_pgcache`) keep the `.venv` and `uv`'s wheel cache out of the bind mount, so editing code doesn't trigger a reinstall and rebuilding the image doesn't redownload every wheel.
+One named volume (`web_pgcache`) keeps `uv`'s wheel cache out of the bind mount, so rebuilding the image doesn't redownload every wheel. The venv lives at `/venv` inside the image (see above), not on a volume.
 
 ### `core/settings.py`
 

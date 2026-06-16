@@ -29,7 +29,6 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-      - web_venv:/app/.venv
       - web_pgcache:/app/.cache/uv
     ports:
       - "8000:8000"
@@ -52,11 +51,9 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-      - web_venv:/app/.venv
       - web_pgcache:/app/.cache/uv
     command: ["python", "manage.py", "seed"]
 
 volumes:
   postgres_data:
-  web_venv:
   web_pgcache:
