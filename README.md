@@ -22,6 +22,25 @@ uv run python manage.py runserver
 
 API docs at <http://localhost:8000/api/docs>.
 
+### Running it with Docker (optional, faster DX)
+
+If you have Docker + Compose, you can skip the Postgres install and the Python toolchain:
+
+```sh
+cp .env.example .env
+docker compose up --build
+```
+
+On first boot this starts a `postgres:16` service, waits for it to be healthy, runs `migrate`, and then `runserver` on `http://localhost:8000`. Edits to Python files are picked up on reload — the project is bind-mounted into the container.
+
+To seed the ~100k posts / ~500k comments (takes a few minutes):
+
+```sh
+docker compose --profile seed run --rm seed
+```
+
+What changed and why → see [DX.md](DX.md).
+
 Seeding writes ~100k posts and ~500k comments. Expect a few minutes.
 
 ## What the API does
