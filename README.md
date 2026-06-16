@@ -39,7 +39,7 @@ To seed the ~100k posts / ~500k comments (takes a few minutes):
 docker compose --profile seed run --rm seed
 ```
 
-What changed and why → see [DX.md](DX.md).
+What changed and why → see [NOTES.md](NOTES.md).
 
 ## What the API does
 

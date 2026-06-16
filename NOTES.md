@@ -1,6 +1,8 @@
-# Developer experience
+# Notes
 
 This document explains the dev-environment changes in this PR and the reasoning behind them. The full request that triggered them is the first bullet of [the assignment](README.md#the-assignment): *"Getting this running on a fresh laptop is harder than it should be. Make it easier."*
+
+A full transcript of the agent session that produced these changes lives at [ai-transcriptions/dx_improvements.txt](ai-transcriptions/dx_improvements.txt).
 
 ## What we assumed
 
@@ -51,7 +53,7 @@ One named volume (`web_pgcache`) keeps `uv`'s wheel cache out of the bind mount,
 Four lines of behavior change, all of them `os.environ.get(..., <previous literal>)`:
 
 - `SECRET_KEY` reads `DJANGO_SECRET_KEY`.
-- `DEBUG` reads `DJANGO_DEBUG` (`"1"` → `True`, anything else → `False`).
+- `DEBUG` reads `DJANGO_DEBUG` (accepts `"1"`, `"true"`, `"yes"`, `"on"`, case-insensitive → `True`; anything else → `False`).
 - `ALLOWED_HOSTS` reads `DJANGO_ALLOWED_HOSTS` (comma-separated).
 - The `DATABASES` block reads `POSTGRES_DB`/`USER`/`PASSWORD`/`HOST`/`PORT`.
 
@@ -66,6 +68,7 @@ Defaults match the prior hardcoded values exactly, so the app behaves the same i
 
 - **No production image.** This is `Dockerfile.dev` on purpose. A production image would need a non-root user, a real WSGI server (`gunicorn`/`uvicorn`), static-file collection, a separate compose file or Helm chart, and a real secret story. None of that belongs in a DX PR.
 - **No seed by default.** The `seed` profile is explicit, not automatic. The first `docker compose up` is intentionally a fresh, empty DB so you can iterate against the schema without waiting minutes or dealing with 600k rows you don't need.
+- **No signal-handling polish in the original.** After review, we did end up adding `exec` to the runserver command so SIGTERM is forwarded to Django (and `docker compose stop` returns in 0s instead of waiting for the 10s SIGKILL grace period). The `seed` service was left as-is because it runs and exits.
 - **No CI changes.** The existing `pytest` setup works inside the container as-is (`docker compose exec web python -m pytest`); we didn't touch `conftest.py` or add a workflow.
 - **No dependency upgrades.** The Dockerfile installs what `uv.lock` already pins. We didn't bump Django, Python, or anything else — that's a separate decision.
 - **No `.env` in `.gitignore`.** It's currently caught by the user's `~/.gitignore_global`, which is enough for the people working on this today. Adding it to the repo's `.gitignore` is a one-liner if we want belt-and-suspenders, but it would commit a contract on a personal preference and we chose not to.
