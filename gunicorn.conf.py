@@ -46,12 +46,78 @@ keepalive = int(os.environ.get("GUNICORN_KEEPALIVE", "5"))
 # deploy-time decision, not ours.
 worker_class = os.environ.get("GUNICORN_WORKER_CLASS", "sync")
 
-# --- logging ---------------------------------------------------------------
+# Load the WSGI app in the master process so any ImproperlyConfigured
+# (bad DJANGO_SECRET_KEY, missing DJANGO_ALLOWED_HOSTS, etc.) fails
+# fast and loudly at boot, before any worker has a chance to crash
+# in a tight respawn loop. The cost is that the master process holds
+# some memory it would otherwise have shared with workers via fork —
+# for a small Django app this is negligible.
+preload_app = True
 
-# `-` means stdout/stderr, so logs flow into `docker logs` / the
-# container runtime's log collector. The level is independent of
-# Django's logger level (set via DJANGO_LOG_LEVEL in settings_prod).
+# --- logging ---------------------------------------------------------------
+#
+# Gunicorn has its own loggers (`gunicorn.access` and `gunicorn.error`)
+# that are configured separately from Django's `LOGGING` setting. To
+# make every line in `docker logs` parseable as JSON, we override
+# gunicorn's logging config via `logconfig_dict` and use
+# `python-json-logger`'s JsonFormatter for both streams.
+#
+# For access logs we extract the gunicorn-arg fields (`h`, `r`, `s`,
+# `b`, `D`, etc.) into top-level JSON keys. For error logs we keep
+# gunicorn's standard message format but JSON-encode it.
+#
+# We still set `accesslog = "-"` and `errorlog = "-"` as a belt-and-
+# braces: gunicorn's gLogging Logger respects the dict's handlers, so
+# the `-` values are redundant when `logconfig_dict` is provided, but
+# keeping them documents the intent.
+
 accesslog = "-"
 errorlog = "-"
 loglevel = os.environ.get("GUNICORN_LOG_LEVEL", "info")
 access_log_format = '%(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)sus'
+
+
+# Gunicorn's two loggers (`gunicorn.access`, `gunicorn.error`) are
+# configured independently of Django's `LOGGING` setting. We use
+# `logconfig_dict` to route them through a JsonFormatter so every
+# line in `docker logs` parses as JSON. The `access_log_format`
+# tokens above (%(h)s, %(r)s, %(s)s, %(b)s, %(D)sus, %(f)s, %(a)s)
+# are the "safe atoms" listed in gunicorn.glogging.Logger atoms();
+# we include them in the formatter's format string so they end up
+# as top-level keys in the JSON object.
+logconfig_dict = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "json": {
+            "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+            "format": (
+                "%(asctime)s %(levelname)s %(name)s %(message)s "
+                "%(h)s %(r)s %(s)s %(b)s %(D)sus %(f)s %(a)s"
+            ),
+        },
+    },
+    "handlers": {
+        "stdout": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "json",
+        },
+    },
+    "root": {
+        "handlers": ["stdout"],
+        "level": os.environ.get("GUNICORN_LOG_LEVEL", "info").upper(),
+    },
+    "loggers": {
+        "gunicorn.error": {
+            "handlers": ["stdout"],
+            "level": os.environ.get("GUNICORN_LOG_LEVEL", "info").upper(),
+            "propagate": False,
+        },
+        "gunicorn.access": {
+            "handlers": ["stdout"],
+            "level": os.environ.get("GUNICORN_LOG_LEVEL", "info").upper(),
+            "propagate": False,
+        },
+    },
+}
