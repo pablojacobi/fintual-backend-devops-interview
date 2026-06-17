@@ -19,19 +19,8 @@ DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
 
 
-def _pagination(request) -> tuple[int, int]:
-    """Read `limit` and `offset` from the query string with sane bounds."""
-    try:
-        limit = int(request.GET.get("limit", DEFAULT_LIMIT))
-    except (TypeError, ValueError):
-        limit = DEFAULT_LIMIT
-    limit = max(1, min(limit, MAX_LIMIT))
-    try:
-        offset = int(request.GET.get("offset", 0))
-    except (TypeError, ValueError):
-        offset = 0
-    offset = max(0, offset)
-    return limit, offset
+def _clamp(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(value, hi))
 
 
 def _serialize_author(user: User) -> dict:
@@ -58,8 +47,9 @@ def _serialize_post_list(post: Post) -> dict:
 
 
 @router.get("/posts", response=list[PostListOut])
-def list_posts(request):
-    limit, offset = _pagination(request)
+def list_posts(request, limit: int = DEFAULT_LIMIT, offset: int = 0):
+    limit = _clamp(limit, 1, MAX_LIMIT)
+    offset = max(0, offset)
     posts = (
         Post.objects
         .select_related("author")
@@ -71,8 +61,9 @@ def list_posts(request):
 
 
 @router.get("/posts/search", response=list[PostListOut])
-def search_posts(request, q: str):
-    limit, offset = _pagination(request)
+def search_posts(request, q: str, limit: int = DEFAULT_LIMIT, offset: int = 0):
+    limit = _clamp(limit, 1, MAX_LIMIT)
+    offset = max(0, offset)
     posts = (
         Post.objects
         .select_related("author")
@@ -87,9 +78,10 @@ def search_posts(request, q: str):
 
 
 @router.get("/posts/by-tag/{slug}", response=list[PostListOut])
-def posts_by_tag(request, slug: str):
+def posts_by_tag(request, slug: str, limit: int = DEFAULT_LIMIT, offset: int = 0):
     tag = get_object_or_404(Tag, slug=slug)
-    limit, offset = _pagination(request)
+    limit = _clamp(limit, 1, MAX_LIMIT)
+    offset = max(0, offset)
     posts = (
         tag.posts
         .select_related("author")
