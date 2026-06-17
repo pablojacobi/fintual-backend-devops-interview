@@ -18,7 +18,6 @@ import os
 from django.core.exceptions import ImproperlyConfigured
 
 from .settings import *  # noqa: F401,F403
-from .settings import BASE_DIR
 
 # --- production toggles -----------------------------------------------------
 
@@ -57,12 +56,6 @@ SECURE_HSTS_PRELOAD = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
-
-# --- static files ----------------------------------------------------------
-
-# `collectstatic` in the prod Dockerfile writes into this dir. The base
-# settings only declares STATIC_URL; we add the on-disk target here.
-STATIC_ROOT = BASE_DIR / "staticfiles"
 
 # --- DB connection pool ----------------------------------------------------
 

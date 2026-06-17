@@ -22,7 +22,15 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-extend-exclude = ["blog/migrations/*"]
+# ruff format is Python-only; skip auto-generated code and non-Python
+# files in the project root.
+extend-exclude = [
+    "blog/migrations/*",
+    "Dockerfile",
+    "Caddyfile",
+    "docker-compose*.yml",
+    ".github",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

@@ -83,5 +83,9 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
+# STATIC_ROOT is the on-disk target for `collectstatic`. The prod
+# Dockerfile runs it during build; in dev it is harmless to have
+# defined and unused. .gitignore excludes `staticfiles/`.
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
