@@ -81,7 +81,7 @@ Defaults match the prior hardcoded values exactly, so the app behaves the same i
 - A separate `docker-compose.prod.yml` (or Helm/ECS) for the production-readiness bullet of the assignment.
 - Wire `pytest` into a CI workflow.
 
-## Etapa 2: Performance
+## Round 2: Performance
 
 The second bullet of [the assignment](README.md#the-assignment) is *"Once the database is seeded, exercise the endpoints. Some of them are slow. Find out why and fix what you can."*
 
@@ -168,7 +168,7 @@ curl -w "\n  total=%{time_total}s\n" -o /dev/null http://localhost:8000/api/post
 
 The plan that produced this section is at [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md).
 
-## Etapa 3: Production readiness
+## Round 3: Production readiness
 
 The third bullet of [the assignment](README.md#the-assignment) is *"This service is a long way from something you'd put behind a load balancer. Move it closer."* The full working plan is at [PROD_PLAN.md](PROD_PLAN.md); this section is the report of what shipped.
 
@@ -208,8 +208,9 @@ All changes are net-additive to the dev path; nothing in `Dockerfile.dev`, `dock
 6. **`docker-compose.prod.yml` + `Caddyfile` + `.env.prod.example` + `.gitignore`.** A `prod` profile brings up `db` (no host port), `migrate` (one-shot, `restart: "no"`, web waits via `service_completed_successfully`), `web` (no host port, only Caddy can reach it), and `caddy` (caddy:2, ports 80+443, mounts the Caddyfile). The Caddyfile uses `tls internal` (self-signed cert) for local prod-like, with a commented-out `on_demand` server block showing what changes for a real deploy. `transport http { versions 1.1 }` pins the upstream to HTTP/1.1 (gunicorn doesn't speak h2). `.env.prod.example` documents every env var with a redacted fake value. `.gitignore` gains `.env.prod` and `staticfiles/`.
 
 7. **GitHub Actions CI (`.github/workflows/ci.yml`).** Two jobs, both on `pull_request` and `push` to `main`:
-   - **`test`** — boots a `postgres:16` service, installs the project with `pip install -e .[dev]` (covers pytest + ruff + the runtime deps), runs `python -m pytest -q`. Caches pip between runs.
-   - **`lint`** — installs the dev deps, runs `ruff check .` and `ruff format --check .`.
+   - **`test`** — boots a `postgres:16` service, installs `uv`, runs `uv sync --frozen` against the committed `uv.lock` (which already pins pytest, pytest-django, ruff and every runtime dep), then `uv run python -m django migrate --noinput` and `uv run pytest -q`. Caches `~/.cache/uv` keyed on `uv.lock`.
+   - **`lint`** — same `uv sync --frozen`, then `uv run ruff check .` and `uv run ruff format --check .`.
+   We use `uv sync` rather than `pip install -e .[dev]` for two reasons. First, the project is a flat layout with two Django apps at the top level (`core/`, `blog/`); setuptools' automatic package discovery refuses to build that without an explicit `[tool.setuptools] packages = [...]` declaration, which we now also ship in `pyproject.toml` as a belt-and-suspenders. Second, `[dependency-groups]` is PEP 735, which `pip` does not recognize as an extra — `uv` understands it natively, so using `uv` in CI keeps the lock file as the single source of truth across dev, image build, and CI.
    No deploy step, no artifact publish, no matrix. One Python version (3.14), one Postgres version (16).
 
 ### What we deliberately didn't do
@@ -224,11 +225,12 @@ All changes are net-additive to the dev path; nothing in `Dockerfile.dev`, `dock
 
 ### Risks and what we'd do with another day
 
+- **The test suite covers health probes but not the actual API surface.** `blog/tests/test_health.py` exercises `/healthz` and `/readyz`, and `blog/tests/test_posts.py` is a smoke test of the `Post` model. None of the real read endpoints — `list_posts`, `get_post`, `posts_by_tag`, `search`, `list_users`, `get_user`, `find_user_by_email` — have a contract test. We relied on the seed + manual `curl` loop (and the perf-round timings) to catch regressions, and the perf round did surface one (the `Count`-annotation cartesian blowup) by re-measuring wall time, not via a failing test. That is fine while one person knows the codebase; it is a liability the moment a second person edits the same code or we revisit the `tsvector` candidate from Round 2, which we explicitly deferred because there were no tests to land it safely behind. **Recommended next step:** add a `pytest-django` case per endpoint that pins the response shape, the pagination contract, the `is_published` filter, and at least one error path (404 on missing post, 422 on bad `limit`/`offset`). The Django Ninja test client makes this cheap; one file per endpoint group, ~10 cases total, no new fixtures beyond the existing seed.
 - **Single-VM Caddy as the public entrypoint is a single point of failure.** The image is fine, but the deployment shape (one VM, one Caddy, one DB volume) isn't HA. Two more VMs behind a load balancer, Postgres to RDS, Caddy to a managed TLS terminator — that's the "move to a managed platform" round.
 - **The dev image is re-tagged when the prod image is built locally** (Docker's `docker compose` and `docker build` both write to `fintual-backend-devops-interview-web`, regardless of the Dockerfile they came from). This is a local-only papercut — a real registry-based flow has two distinct image names. It's documented in the Phase 4 commit message so the next person doesn't trip on it.
 - **The access log JSON has the gunicorn "atoms" (`h`, `r`, `s`, `b`, `D`, `f`, `a`) as `null` on non-access lines** (worker boot, error). We could split access and error into two formatters with different field sets, but the current shape is consistent and parses cleanly. A clean fix is a follow-up.
 - **Caddy logs are Caddy's default JSON, not our `python-json-logger` shape.** Both are JSON, both are parseable, but field names differ. A small mapping layer at the log collector is the easy fix; the alternative is configuring Caddy to emit our exact schema.
-- **The dev image is not used in CI; CI installs from PyPI.** The CI workflow is `pip install -e .[dev]`, which pulls the dependencies from PyPI against the committed `uv.lock`. If you want "CI tests the actual prod image", add a `docker build` + `docker run` job that boots the image and runs the tests against it. That's a meaningful next step and a one-job addition.
+- **The dev image is not used in CI; CI installs from PyPI via the lock file.** The CI workflow uses `uv sync --frozen` against the committed `uv.lock`, which pulls the same pinned deps that the dev and prod images use. If you want "CI tests the actual prod image", add a `docker build` + `docker run` job that boots the image and runs the tests against it. That's a meaningful next step and a one-job addition.
 
 ### How to reproduce
 

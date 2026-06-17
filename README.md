@@ -61,7 +61,7 @@ docker compose -f docker-compose.prod.yml --profile prod --env-file .env.prod do
 
 The full plan and decisions for this round are at
 [PROD_PLAN.md](PROD_PLAN.md); the report of what was actually shipped is in
-the "Etapa 3" section of [NOTES.md](NOTES.md).
+the "Round 3" section of [NOTES.md](NOTES.md).
 
 ## What the API does
 
