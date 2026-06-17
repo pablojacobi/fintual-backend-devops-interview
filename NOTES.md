@@ -1,10 +1,16 @@
 # Notes
 
-This document explains the dev-environment changes in this PR and the reasoning behind them. The full request that triggered them is the first bullet of [the assignment](README.md#the-assignment): *"Getting this running on a fresh laptop is harder than it should be. Make it easier."*
+This document is the running record of the three rounds the project went through to get from "hard to run on a fresh laptop" to "deployable behind a load balancer", in order. Each round stands on its own: what we measured, what we changed, what we deliberately didn't, and a transcript link at the bottom.
 
-A full transcript of the agent session that produced these changes lives at [ai-transcriptions/dx_improvements.txt](ai-transcriptions/dx_improvements.txt).
+The full plan for each round lives next to this file: [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md) for round 2, [PROD_PLAN.md](PROD_PLAN.md) for round 3. The transcripts of the agent sessions that produced each round are in [ai-transcriptions/](ai-transcriptions/).
 
-## What we assumed
+## Round 1: Dev experience
+
+The first bullet of [the assignment](README.md#the-assignment) is *"Getting this running on a fresh laptop is harder than it should be. Make it easier."* This section is the report of what shipped.
+
+The full transcript of the agent session that produced this round is at [ai-transcriptions/dx_improvements.txt](ai-transcriptions/dx_improvements.txt).
+
+#### What we assumed
 
 This service might be running in production somewhere. We don't know that it isn't. So the rule of thumb for every change was:
 
@@ -18,7 +24,7 @@ In practice that meant:
 
 If you `git diff` only `core/settings.py` you can confirm that: every default matches the previous hardcoded value, so behavior is identical when env vars are absent.
 
-## What's in the box
+### What's in the box
 
 A new dev can go from `git clone` to a running API in three commands:
 
@@ -30,7 +36,7 @@ docker compose up --build
 
 No `mise`, no `uv` toolchain, no local Postgres, no `createdb`. Docker is the only prereq.
 
-### `Dockerfile.dev`
+#### `Dockerfile.dev`
 
 - Based on `python:3.14-slim` (same version the project's `pyproject.toml` requires).
 - Installs `uv` with `pip` rather than copying a multi-stage image, to keep the file standalone and easy to read.
@@ -38,7 +44,7 @@ No `mise`, no `uv` toolchain, no local Postgres, no `createdb`. Docker is the on
 - Installs the venv at `/venv` (outside of `/app`) and prepends it to `PATH`, so the final `CMD` is just `python manage.py runserver` — no `uv run` wrapper. Putting the venv outside the bind mount is intentional: a named volume at `/app/.venv` would mask the freshly-built venv on rebuilds, forcing `docker compose down -v` to clear stale deps.
 - `runserver` is used (not `gunicorn`) so that Django's `StatReloader` picks up source edits from the bind mount.
 
-### `docker-compose.yml`
+#### `docker-compose.yml`
 
 Three services, two of which you'll actually use:
 
@@ -48,7 +54,7 @@ Three services, two of which you'll actually use:
 
 One named volume (`web_pgcache`) keeps `uv`'s wheel cache out of the bind mount, so rebuilding the image doesn't redownload every wheel. The venv lives at `/venv` inside the image (see above), not on a volume.
 
-### `core/settings.py`
+#### `core/settings.py`
 
 Four lines of behavior change, all of them `os.environ.get(..., <previous literal>)`:
 
@@ -59,12 +65,12 @@ Four lines of behavior change, all of them `os.environ.get(..., <previous litera
 
 Defaults match the prior hardcoded values exactly, so the app behaves the same in production or in any environment that doesn't set these vars.
 
-### `.env.example` and `.dockerignore`
+#### `.env.example` and `.dockerignore`
 
-- `.env.example` is a copy-able template. `.env` itself is git-ignored (by the user's global gitignore, not the repo's — the repo's `.gitignore` doesn't list it, which is a known minor gap we'll discuss below).
+- `.env.example` is a copy-able template. `.env` itself is **not** listed in this repo's `.gitignore` — it is currently caught only by the user's `~/.gitignore_global`. See the "What we deliberately didn't do" section below for why we chose not to add it.
 - `.dockerignore` keeps `.venv`, `.git`, `__pycache__`, the `.env`, and the docker files themselves out of the build context.
 
-## What we deliberately didn't do
+### What we deliberately didn't do
 
 - **No production image.** This is `Dockerfile.dev` on purpose. A production image would need a non-root user, a real WSGI server (`gunicorn`/`uvicorn`), static-file collection, a separate compose file or Helm chart, and a real secret story. None of that belongs in a DX PR.
 - **No seed by default.** The `seed` profile is explicit, not automatic. The first `docker compose up` is intentionally a fresh, empty DB so you can iterate against the schema without waiting minutes or dealing with 600k rows you don't need.
@@ -73,7 +79,7 @@ Defaults match the prior hardcoded values exactly, so the app behaves the same i
 - **No dependency upgrades.** The Dockerfile installs what `uv.lock` already pins. We didn't bump Django, Python, or anything else — that's a separate decision.
 - **No `.env` in `.gitignore`.** It's currently caught by the user's `~/.gitignore_global`, which is enough for the people working on this today. Adding it to the repo's `.gitignore` is a one-liner if we want belt-and-suspenders, but it would commit a contract on a personal preference and we chose not to.
 
-## What we'd do with another day
+### What we'd do with another day
 
 - Add a tiny `Makefile` (or `justfile`) with `up`, `down`, `logs`, `test`, `lint`, `seed`, `shell` targets. Three lines each, but they remove a lot of typing.
 - Switch the dev reloader to `watchfiles` for inotify-style hot reload instead of the 1-second `StatReloader` polling.
@@ -127,7 +133,7 @@ All changes live in two files: `blog/api.py` (query construction) and `blog/migr
 | `GET /api/posts/by-tag/python?limit=200` | 26 ms | 3 | **~400×** |
 | `GET /api/posts/1` | 19 ms | 5 | **7×** |
 | `GET /api/posts/100` | 15 ms | 5 | **7×** |
-| `GET /api/posts/search?q=doctor&limit=50` (a `q` that matches) | 120 ms | 1 | **~3×** (330 ms → 120 ms in DB; trigram index is the safety net) |
+| `GET /api/posts/search?q=doctor&limit=50` (a `q` that matches) | 120 ms | 1 | **~2.7×** (330 ms → 120 ms in DB; trigram index is the safety net) |
 | `GET /api/users/1` | 9 ms | 3 | **1.3×** |
 | `GET /api/users/find?email=…` | 8 ms | 3 | **1.4×** |
 
