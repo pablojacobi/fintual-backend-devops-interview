@@ -167,3 +167,85 @@ curl -w "\n  total=%{time_total}s\n" -o /dev/null http://localhost:8000/api/post
 ```
 
 The plan that produced this section is at [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md).
+
+## Etapa 3: Production readiness
+
+The third bullet of [the assignment](README.md#the-assignment) is *"This service is a long way from something you'd put behind a load balancer. Move it closer."* The full working plan is at [PROD_PLAN.md](PROD_PLAN.md); this section is the report of what shipped.
+
+### Rule of thumb
+
+> Make the artifact deployable and document the recipe; do not actually deploy it.
+
+In practice that meant:
+
+- **No real infra, no CD, no secrets manager.** A real deployment would involve at least Terraform/Pulumi for the VM, a secrets store (Vault, AWS Secrets Manager, SOPS), a CD pipeline (GitHub Actions + ArgoCD / Spinnaker / equivalent), and a log/metric pipeline. None of that is in this round. What is in this round is the image, the gunicorn config, the prod settings, the health probes, the Caddyfile, and a `docker-compose.prod.yml` that brings all four services up on a single laptop behind a self-signed cert.
+- **Production settings live in their own file.** `core/settings_prod.py` inherits from `core/settings.py` and overrides only the prod-only knobs. Dev still uses `core.settings` everywhere (Dockerfile.dev, docker-compose, pytest, the existing test fixtures). The split is real, not a one-line flag: it makes accidental "run prod settings in dev" harder to do, and it makes the prod-only invariants (`ALLOWED_HOSTS` no `*`, `SECRET_KEY` not the dev placeholder) fail-closed at import time.
+- **The prod image is the only artifact.** No "deploy from the dev image, just override the command". The Dockerfile is multi-stage, non-root, has `collectstatic` baked in, and runs gunicorn as PID 1 so SIGTERM reaches it directly. Bind mounts are gone.
+- **Local prod-like is the verification surface.** A `docker-compose.prod.yml` stack with a `prod` profile brings the image up behind Caddy and lets us curl the real wire. If the artifact doesn't boot there, it doesn't ship.
+
+### What we changed
+
+All changes are net-additive to the dev path; nothing in `Dockerfile.dev`, `docker-compose.yml`, or `core/settings.py` was broken by this round.
+
+1. **Lint cleanup (`pyproject.toml`, `blog/admin.py`, `blog/management/commands/seed.py`).** Prereq for the CI step. `ruff check .` was reporting 9 issues — 1 unused import, 1 unused loop variable, 7 long lines in `blog/migrations/0001_initial.py` (auto-generated, so we now skip `blog/migrations/*` in ruff's `extend-exclude`). Also ran `ruff format` on the 6 files that hadn't been formatted yet; mechanical, no semantic change.
+
+2. **Settings split (`core/settings_prod.py`).** New module that imports from `core.settings` and overrides the prod knobs. Three fail-closed guards at import time:
+   - `DJANGO_ALLOWED_HOSTS` must be set and must not contain `*` (the dev default of `*` would be a security regression in prod).
+   - `DJANGO_SECRET_KEY` must be set and must not match the dev placeholder (`django-insecure-*`).
+   - `STATIC_ROOT` is defined in the base settings (it has to be: the prod `Dockerfile` runs `collectstatic` during build, against the dev settings module, to bake the static files into the image).
+   Other prod knobs: `SECURE_PROXY_SSL_HEADER`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`, HSTS for 1 year with includeSubDomains + preload, `SECURE_CONTENT_TYPE_NOSNIFF`, `SECURE_REFERRER_POLICY='same-origin'`, `X_FRAME_OPTIONS='DENY'`, `CONN_MAX_AGE=60`, `CONN_HEALTH_CHECKS=True`, and a JSON `LOGGING` block with python-json-logger.
+
+3. **Production `Dockerfile` (multi-stage, non-root, `collectstatic` baked).**
+   - `builder` stage: `python:3.14-slim`, `uv sync --frozen --no-install-project --no-dev`, then `python manage.py collectstatic --noinput` against the dev settings module. The static files are baked into the runtime stage.
+   - `runtime` stage: same base, copies `/venv` and `/app` from the builder, creates an `app` user (uid 1000), chowns `/app`, `USER app`, `EXPOSE 8000`, `CMD ["gunicorn", "core.wsgi:application", "-c", "gunicorn.conf.py"]`. `gunicorn` is PID 1 — SIGTERM from `docker stop` reaches it directly, the 30s `graceful_timeout` gives workers headroom to finish in-flight requests.
+
+4. **`gunicorn.conf.py`.** Read-only config that the operator can override via env vars: `bind=0.0.0.0:8000`, `workers=(2*cpu_count)+1` (gunicorn's recommended default for sync workers), `worker_class=sync`, `timeout/graceful_timeout/keepalive = 30/30/5s`, `accesslog=errorlog="-"` (stdout). `preload_app=True` so any `ImproperlyConfigured` from `core/settings_prod.py` fails fast at the master's boot, not in a worker respawn loop. `logconfig_dict` routes gunicorn's own `gunicorn.access` and `gunicorn.error` loggers through a `pythonjsonlogger.jsonlogger.JsonFormatter`, so every line in `docker logs` parses as JSON (gunicorn's default formatter would otherwise emit plain text and break the rule).
+
+5. **Health endpoints (`core/health.py` + `core/urls.py` + `blog/tests/test_health.py`).** Two endpoints at the project root, NOT under `/api/`, so an orchestrator can hit them without coupling to the app routing:
+   - `GET /healthz` — liveness. Returns 200 + `{"status":"ok"}` with **zero DB queries** (a `CaptureQueriesContext` test asserts this). The orchestrator must keep this instance alive even when the DB is down.
+   - `GET /readyz` — readiness. Runs `SELECT 1` against the default connection; returns 200 + `{"status":"ok","db":"ok"}` on success, 503 + `{"status":"degraded","db":"down","error":"…"}` on any failure. The 1-second connect-timeout hint is set via `connection.get_connection_params()["connect_timeout"] = 1.0` so a hung DB doesn't block the readiness gate. Tests cover both 200 and 503 paths.
+
+6. **`docker-compose.prod.yml` + `Caddyfile` + `.env.prod.example` + `.gitignore`.** A `prod` profile brings up `db` (no host port), `migrate` (one-shot, `restart: "no"`, web waits via `service_completed_successfully`), `web` (no host port, only Caddy can reach it), and `caddy` (caddy:2, ports 80+443, mounts the Caddyfile). The Caddyfile uses `tls internal` (self-signed cert) for local prod-like, with a commented-out `on_demand` server block showing what changes for a real deploy. `transport http { versions 1.1 }` pins the upstream to HTTP/1.1 (gunicorn doesn't speak h2). `.env.prod.example` documents every env var with a redacted fake value. `.gitignore` gains `.env.prod` and `staticfiles/`.
+
+7. **GitHub Actions CI (`.github/workflows/ci.yml`).** Two jobs, both on `pull_request` and `push` to `main`:
+   - **`test`** — boots a `postgres:16` service, installs the project with `pip install -e .[dev]` (covers pytest + ruff + the runtime deps), runs `python -m pytest -q`. Caches pip between runs.
+   - **`lint`** — installs the dev deps, runs `ruff check .` and `ruff format --check .`.
+   No deploy step, no artifact publish, no matrix. One Python version (3.14), one Postgres version (16).
+
+### What we deliberately didn't do
+
+- **No Helm chart, K8s manifests, ECS task def, Fly, or Render config.** The recipe in `PROD_PLAN.md` is "plain Docker + Caddy on a single VM". The Dockerfile + compose + Caddyfile are the minimum that gets you to "one command away from a deploy"; converting that to a K8s manifest is a follow-up and a one-day job. We did not pre-build it because (a) the deployment target depends on where the company actually runs things, and (b) building it well requires the same Terraform/Vault work that's out of scope this round.
+- **No actual deployment.** Per the rule of thumb. The compose stack comes up and serves the API over `https://localhost` with a self-signed cert. We did not point a real domain at it.
+- **No secrets manager integration.** `DJANGO_SECRET_KEY` and `POSTGRES_PASSWORD` live in `.env.prod`, which is in `.gitignore`. A real deployment would have these injected from Vault / SOPS / the orchestrator's secret store. The fail-closed guards in `core/settings_prod.py` are the contract: if the env var is missing or matches the dev placeholder, the container refuses to start. Whichever secret store you wire in, the contract is the same.
+- **No CD.** CI runs tests and lint on PR and push-to-main. There is no `deploy` job, no GHCR push, no `kubectl apply`. Adding a CD step is a separate round and depends on the deployment target.
+- **No observability stack.** Logs are JSON to stdout (gunicorn + Django). There is no Prometheus exporter, no OpenTelemetry tracing, no Datadog agent. The JSON logs are structured enough for any log collector to parse; that's the part of "production observability" we picked up.
+- **No rate limiting, no WAF, no auth proxy.** All out of scope per the assignment ("authentication / authorization is intentionally absent").
+- **No `Dockerfile.dev` changes.** It still does `uv sync --frozen --no-install-project` against the committed `uv.lock` and runs `runserver`. The lint cleanup touched `pyproject.toml`'s `extend-exclude`, which `ruff` reads inside the dev container too; the dev path is otherwise untouched.
+
+### Risks and what we'd do with another day
+
+- **Single-VM Caddy as the public entrypoint is a single point of failure.** The image is fine, but the deployment shape (one VM, one Caddy, one DB volume) isn't HA. Two more VMs behind a load balancer, Postgres to RDS, Caddy to a managed TLS terminator — that's the "move to a managed platform" round.
+- **The dev image is re-tagged when the prod image is built locally** (Docker's `docker compose` and `docker build` both write to `fintual-backend-devops-interview-web`, regardless of the Dockerfile they came from). This is a local-only papercut — a real registry-based flow has two distinct image names. It's documented in the Phase 4 commit message so the next person doesn't trip on it.
+- **The access log JSON has the gunicorn "atoms" (`h`, `r`, `s`, `b`, `D`, `f`, `a`) as `null` on non-access lines** (worker boot, error). We could split access and error into two formatters with different field sets, but the current shape is consistent and parses cleanly. A clean fix is a follow-up.
+- **Caddy logs are Caddy's default JSON, not our `python-json-logger` shape.** Both are JSON, both are parseable, but field names differ. A small mapping layer at the log collector is the easy fix; the alternative is configuring Caddy to emit our exact schema.
+- **The dev image is not used in CI; CI installs from PyPI.** The CI workflow is `pip install -e .[dev]`, which pulls the dependencies from PyPI against the committed `uv.lock`. If you want "CI tests the actual prod image", add a `docker build` + `docker run` job that boots the image and runs the tests against it. That's a meaningful next step and a one-job addition.
+
+### How to reproduce
+
+```sh
+# from a clean checkout of chore/prod-readiness
+cp .env.prod.example .env.prod
+# edit DJANGO_SECRET_KEY; you can use:
+#   python3 -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+docker compose -f docker-compose.prod.yml --profile prod \
+    --env-file .env.prod up --build
+# wait for the four services to come up
+sleep 3
+curl -sk https://localhost/healthz      # {"status":"ok"}            <10ms
+curl -sk https://localhost/readyz       # {"status":"ok","db":"ok"}  ~10ms
+curl -sk https://localhost/api/posts    # the seeded JSON list (paginated)
+docker compose -f docker-compose.prod.yml --profile prod \
+    --env-file .env.prod down -v        # tear down + remove named volumes
+```
+
+The plan that produced this section is at [PROD_PLAN.md](PROD_PLAN.md). The full transcript of the agent session that produced this round is at [ai-transcriptions/prod_readiness_round.txt](ai-transcriptions/prod_readiness_round.txt).

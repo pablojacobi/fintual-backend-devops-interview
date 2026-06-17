@@ -41,6 +41,28 @@ docker compose --profile seed run --rm seed
 
 What changed and why → see [NOTES.md](NOTES.md).
 
+### Running a production-like stack locally (optional)
+
+There is a second compose file that brings up a four-service prod-like stack
+behind a Caddy reverse proxy with a self-signed cert: db + migrate one-shot +
+gunicorn web + caddy. No bind mount, no live reload, JSON logs to stdout,
+`/healthz` and `/readyz` at the project root. Useful for sanity-checking the
+prod image and the Caddyfile without standing up a real VM.
+
+```sh
+cp .env.prod.example .env.prod
+# edit DJANGO_SECRET_KEY in .env.prod
+docker compose -f docker-compose.prod.yml --profile prod \
+    --env-file .env.prod up --build
+# open https://localhost/api/docs (browser will warn about self-signed cert;
+# `curl -sk https://localhost/healthz` works without a warning)
+docker compose -f docker-compose.prod.yml --profile prod --env-file .env.prod down -v
+```
+
+The full plan and decisions for this round are at
+[PROD_PLAN.md](PROD_PLAN.md); the report of what was actually shipped is in
+the "Etapa 3" section of [NOTES.md](NOTES.md).
+
 ## What the API does
 
 | Method | Path | Description |
