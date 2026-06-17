@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# One Python version, one Postgres version. No matrix. This is
+# the smallest CI that gives signal on the codebase; if you need
+# more (older Pythons, multiple DBs, code coverage) those are
+# follow-up rounds, not a one-PR change.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: backend_devops_interview
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: backend_devops_interview
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      DJANGO_SETTINGS_MODULE: core.settings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # pip install -e .[dev] pulls every runtime dep AND the dev
+          # group (pytest, pytest-django, ruff) from PyPI against the
+          # committed pyproject.toml. uv is not required for CI to
+          # run, but the lock file is the source of truth; for the
+          # full reproducibility story, swap to `uv sync --frozen`.
+          pip install -e ".[dev]"
+
+      - name: Run migrations
+        run: python -m django migrate --noinput
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
