@@ -6,3 +6,17 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 *.sqlite3
+
+# Local config
+.env
+.env.prod
+
+# Build output (the prod Dockerfile bakes collectstatic into the image)
+staticfiles/
+
+# Caddy local state (the prod compose mounts named volumes for this,
+# so this only catches the case where a developer runs Caddy directly)
+.caddy/
+
+# uv / pip
+.uv-cache/

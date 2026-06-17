@@ -1,0 +1,73 @@
+# Caddy reverse proxy in front of the prod gunicorn stack.
+#
+# Local prod-like: the active server block uses `tls internal` so
+# Caddy generates a self-signed cert at runtime. The whole stack
+# comes up with `docker compose --profile prod up --build` and you
+# reach it at https://localhost (browsers will warn about the
+# self-signed cert; `curl -k` skips that).
+#
+# To deploy for real: replace the active block with the commented-
+# out example below, set a real hostname, and provide an
+# `email` for the ACME registration.
+
+# --- Active: local prod-like (self-signed TLS) ---------------------------
+{
+	# Empty global options block; left here so adding options like
+	# `admin off` or `servers :443` later is one line, not a
+	# structural change.
+}
+
+https://localhost {
+	tls internal
+
+	# Reverse-proxy to gunicorn. The host:port matches the `web`
+	# service in docker-compose.prod.yml. We pin the upstream
+	# transport to HTTP/1.1 because gunicorn doesn't speak h2 to
+	# the client-side connection.
+	reverse_proxy web:8000 {
+		transport http {
+			versions 1.1
+		}
+	}
+
+	# Belt-and-braces: re-emit the security headers even though
+	# Django already sets them, so a misconfigured reverse proxy
+	# in front of THIS Caddy doesn't strip them out.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+	header X-Content-Type-Options "nosniff"
+	header X-Frame-Options "DENY"
+	header Referrer-Policy "same-origin"
+
+	# Caddy logs every request to stdout in JSON-ish format.
+	# The access log is the operator's view into traffic; the
+	# service itself emits gunicorn's own JSON access logs to
+	# the `web` container's stdout.
+	encode zstd gzip
+}
+
+# --- Reference: real deployment -----------------------------------------
+# When the stack is moved to a VM with a real hostname and DNS:
+#
+# https://api.example.com {
+#     tls {
+#         # Caddy will fetch a Let's Encrypt cert on first request
+#         # using the email below. Replace with a real address.
+#         on_demand
+#     }
+#     reverse_proxy web:8000 {
+#         transport http {
+#             versions 1.1
+#         }
+#     }
+#     header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+#     header X-Content-Type-Options "nosniff"
+#     header X-Frame-Options "DENY"
+#     header Referrer-Policy "same-origin"
+#     encode zstd gzip
+# }
+#
+# For the ACME email, set the `email` global option:
+#
+# {
+#     email ops@example.com
+# }
