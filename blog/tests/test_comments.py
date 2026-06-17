@@ -13,9 +13,7 @@ def client():
 
 @pytest.mark.django_db
 def test_create_comment(client):
-    user = User.objects.create(
-        username="bob", email="bob@example.com", display_name="Bob"
-    )
+    user = User.objects.create(username="bob", email="bob@example.com", display_name="Bob")
     post = Post.objects.create(author=user, title="T", body="B")
 
     response = client.post(
