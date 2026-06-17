@@ -1,28 +1,12 @@
 # Notes
 
-This document is the running record of the three rounds the project went through to get from "hard to run on a fresh laptop" to "deployable behind a load balancer", in order. Each round stands on its own: what we measured, what we changed, what we deliberately didn't, and a transcript link at the bottom.
-
-The full plan for each round lives next to this file: [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md) for round 2, [PROD_PLAN.md](PROD_PLAN.md) for round 3. The transcripts of the agent sessions that produced each round are in [ai-transcriptions/](ai-transcriptions/).
+This document is the running record of the three rounds the project went through: round 1 (dev experience), round 2 (performance), round 3 (production readiness). Each round has a transcript in [ai-transcriptions/](ai-transcriptions/) and, where a plan existed, a plan file in the repo root.
 
 ## Round 1: Dev experience
 
-The first bullet of [the assignment](README.md#the-assignment) is *"Getting this running on a fresh laptop is harder than it should be. Make it easier."* This section is the report of what shipped.
+The first bullet of [the assignment](README.md#the-assignment) is *"Getting this running on a fresh laptop is harder than it should be. Make it easier."* The rule of thumb was: **touch the product as little as possible, touch the developer's machine as much as needed** — `core/settings.py` was the only application file edited, and only to read values that were already hardcoded from environment variables instead. Everything new is dev-only.
 
 The full transcript of the agent session that produced this round is at [ai-transcriptions/dx_improvements.txt](ai-transcriptions/dx_improvements.txt).
-
-#### What we assumed
-
-This service might be running in production somewhere. We don't know that it isn't. So the rule of thumb for every change was:
-
-> Touch the product as little as possible. Touch the developer's machine as much as needed.
-
-In practice that meant:
-
-- No changes to domain code, models, the API, or migrations.
-- `core/settings.py` was the only application file edited, and only to read values that were already hardcoded from environment variables instead.
-- Everything new is dev-only: `Dockerfile.dev`, `docker-compose.yml`, `.dockerignore`, `.env.example`, this file, and the README section that links here.
-
-If you `git diff` only `core/settings.py` you can confirm that: every default matches the previous hardcoded value, so behavior is identical when env vars are absent.
 
 ### What's in the box
 
@@ -38,8 +22,6 @@ No `mise`, no `uv` toolchain, no local Postgres, no `createdb`. Docker is the on
 
 #### `Dockerfile.dev`
 
-- Based on `python:3.14-slim` (same version the project's `pyproject.toml` requires).
-- Installs `uv` with `pip` rather than copying a multi-stage image, to keep the file standalone and easy to read.
 - Runs `uv sync --frozen --no-install-project` against the committed `uv.lock`, including dev dependencies (`pytest`, `ruff`) so tests and lint work inside the container too. The `--no-install-project` flag tells uv to only resolve third-party deps in the deps-only stage; the project itself is bind-mounted on top and `runserver` finds it via `PYTHONPATH`, so we don't need to re-bake it into the image every time a file changes.
 - Installs the venv at `/venv` (outside of `/app`) and prepends it to `PATH`, so the final `CMD` is just `python manage.py runserver` — no `uv run` wrapper. Putting the venv outside the bind mount is intentional: a named volume at `/app/.venv` would mask the freshly-built venv on rebuilds, forcing `docker compose down -v` to clear stale deps.
 - `runserver` is used (not `gunicorn`) so that Django's `StatReloader` picks up source edits from the bind mount.
@@ -72,20 +54,15 @@ Defaults match the prior hardcoded values exactly, so the app behaves the same i
 
 ### What we deliberately didn't do
 
-- **No production image.** This is `Dockerfile.dev` on purpose. A production image would need a non-root user, a real WSGI server (`gunicorn`/`uvicorn`), static-file collection, a separate compose file or Helm chart, and a real secret story. None of that belongs in a DX PR.
+- **No production image.** This is `Dockerfile.dev` on purpose. A production image would need a non-root user, a real WSGI server (`gunicorn`/`uvicorn`), static-file collection, a separate compose file or Helm chart, and a real secret story. None of that belongs in a DX PR. (Round 3 takes this on.)
 - **No seed by default.** The `seed` profile is explicit, not automatic. The first `docker compose up` is intentionally a fresh, empty DB so you can iterate against the schema without waiting minutes or dealing with 600k rows you don't need.
 - **No signal-handling polish in the original.** After review, we did end up adding `exec` to the runserver command so SIGTERM is forwarded to Django (and `docker compose stop` returns in 0s instead of waiting for the 10s SIGKILL grace period). The `seed` service was left as-is because it runs and exits.
-- **No CI changes.** The existing `pytest` setup works inside the container as-is (`docker compose exec web python -m pytest`); we didn't touch `conftest.py` or add a workflow.
-- **No dependency upgrades.** The Dockerfile installs what `uv.lock` already pins. We didn't bump Django, Python, or anything else — that's a separate decision.
 - **No `.env` in `.gitignore`.** It's currently caught by the user's `~/.gitignore_global`, which is enough for the people working on this today. Adding it to the repo's `.gitignore` is a one-liner if we want belt-and-suspenders, but it would commit a contract on a personal preference and we chose not to.
 
 ### What we'd do with another day
 
-- Add a tiny `Makefile` (or `justfile`) with `up`, `down`, `logs`, `test`, `lint`, `seed`, `shell` targets. Three lines each, but they remove a lot of typing.
-- Switch the dev reloader to `watchfiles` for inotify-style hot reload instead of the 1-second `StatReloader` polling.
-- Add a `migrations` service that runs `makemigrations` and exits, useful for the "I edited a model, what now?" path.
-- A separate `docker-compose.prod.yml` (or Helm/ECS) for the production-readiness bullet of the assignment.
-- Wire `pytest` into a CI workflow.
+- A tiny `Makefile` (or `justfile`) with `up`, `down`, `logs`, `test`, `lint`, `seed`, `shell` targets. Three lines each, but they remove a lot of typing.
+- A `migrations` service that runs `makemigrations` and exits, useful for the "I edited a model, what now?" path.
 
 ## Round 2: Performance
 
