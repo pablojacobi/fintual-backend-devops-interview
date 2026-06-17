@@ -8,6 +8,8 @@ dependencies = [
     "django-ninja>=1.5,<2",
     "psycopg[binary]>=3.3,<4",
     "faker>=30",
+    "gunicorn>=23",
+    "python-json-logger>=3",
 ]
 
 [dependency-groups]
