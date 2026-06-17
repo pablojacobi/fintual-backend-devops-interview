@@ -76,7 +76,7 @@ class Command(BaseCommand):
         with transaction.atomic():
             for chunk_start in range(0, NUM_POSTS, BATCH):
                 chunk = []
-                for i in range(chunk_start, min(chunk_start + BATCH, NUM_POSTS)):
+                for _ in range(chunk_start, min(chunk_start + BATCH, NUM_POSTS)):
                     if random.random() < 0.5:
                         ts = _random_time(recency_cutoff, now)
                     else:

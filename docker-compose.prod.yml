@@ -1,0 +1,108 @@
+# Production-like compose stack. Use the `prod` profile so this file
+# never collides with the DX `docker-compose.yml`:
+#
+#   docker compose --profile prod --env-file .env.prod up --build
+#   docker compose --profile prod --env-file .env.prod down -v
+#
+# Note: docker compose reads variable interpolation (`${POSTGRES_*}`)
+# from the env file passed to `--env-file`, not from the default
+# `.env`. We pass `--env-file .env.prod` explicitly so the prod
+# stack never accidentally reads the dev `.env` (which has the dev
+# postgres password).
+#
+# Pass criteria for this stack is in PROD_PLAN.md (Phase 4). The
+# rough flow: db healthy -> migrate runs once -> web serves on
+# :8000 (not published; only the caddy reverse proxy on :80/:443
+# reaches it) -> caddy terminates TLS and forwards to web.
+#
+# All env comes from `.env.prod` (see `.env.prod.example`). The
+# fail-closed guards in core/settings_prod.py catch missing or
+# dev-placeholder values at boot.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-backend_devops_interview}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.prod}
+    volumes:
+      - prod_pgdata:/var/lib/postgresql/data
+    # No host port. Only the `web` and `migrate` services (on the
+    # compose network) can talk to the DB.
+    expose:
+      - "5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-backend_devops_interview}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    # Same image as `web`. Runs `migrate --noinput` once and exits.
+    # `restart: no` plus a `service_completed_successfully` dependency
+    # in `web` guarantees web waits for migrations to finish.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.prod
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    restart: "no"
+    # No volume, no entrypoint script; this is a one-shot.
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.prod
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # No host port. The reverse proxy on the compose network reaches
+    # us at web:8000. Caddy handles the public listener.
+    expose:
+      - "8000"
+    # Run the prod server. Using the explicit `-c gunicorn.conf.py`
+    # here documents the wire-up; gunicorn.conf.py is the same file
+    # the Dockerfile's CMD points at.
+    command: ["gunicorn", "core.wsgi:application", "-c", "gunicorn.conf.py"]
+    # No bind-mount: the prod image is self-contained.
+    restart: unless-stopped
+
+  caddy:
+    # Local prod-like: `tls internal` makes Caddy generate a self-
+    # signed cert at runtime so the whole stack can come up without
+    # an external CA. To deploy for real, swap the server block in
+    # Caddyfile for the commented-out email line and a real hostname.
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  prod_pgdata:
+  caddy_data:
+  caddy_config:

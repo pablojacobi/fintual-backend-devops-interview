@@ -51,11 +51,10 @@ def list_posts(request, limit: int = DEFAULT_LIMIT, offset: int = 0):
     limit = _clamp(limit, 1, MAX_LIMIT)
     offset = max(0, offset)
     posts = (
-        Post.objects
-        .select_related("author")
+        Post.objects.select_related("author")
         .prefetch_related("tags")
         .filter(is_published=True)
-        .order_by("-created_at")[offset:offset + limit]
+        .order_by("-created_at")[offset : offset + limit]
     )
     return [_serialize_post_list(p) for p in posts]
 
@@ -65,14 +64,13 @@ def search_posts(request, q: str, limit: int = DEFAULT_LIMIT, offset: int = 0):
     limit = _clamp(limit, 1, MAX_LIMIT)
     offset = max(0, offset)
     posts = (
-        Post.objects
-        .select_related("author")
+        Post.objects.select_related("author")
         .prefetch_related("tags")
         .filter(
             Q(title__icontains=q) | Q(body__icontains=q),
             is_published=True,
         )
-        .order_by("-created_at")[offset:offset + limit]
+        .order_by("-created_at")[offset : offset + limit]
     )
     return [_serialize_post_list(p) for p in posts]
 
@@ -83,11 +81,10 @@ def posts_by_tag(request, slug: str, limit: int = DEFAULT_LIMIT, offset: int = 0
     limit = _clamp(limit, 1, MAX_LIMIT)
     offset = max(0, offset)
     posts = (
-        tag.posts
-        .select_related("author")
+        tag.posts.select_related("author")
         .prefetch_related("tags")
         .filter(is_published=True)
-        .order_by("-created_at")[offset:offset + limit]
+        .order_by("-created_at")[offset : offset + limit]
     )
     return [_serialize_post_list(p) for p in posts]
 

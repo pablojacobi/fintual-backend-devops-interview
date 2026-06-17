@@ -8,7 +8,18 @@ dependencies = [
     "django-ninja>=1.5,<2",
     "psycopg[binary]>=3.3,<4",
     "faker>=30",
+    "gunicorn>=23",
+    "python-json-logger>=3",
 ]
+
+# The project is a flat layout with two Django apps at the top
+# level (core/, blog/). setuptools' automatic package discovery
+# refuses to build this without help, because it can't decide
+# which directories are packages. We point it at the two real
+# packages explicitly so any pip-based consumer of the project
+# (or tooling that does its own setuptools pass) can resolve it.
+[tool.setuptools]
+packages = ["core", "blog"]
 
 [dependency-groups]
 dev = [
@@ -20,6 +31,15 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py314"
+# ruff format is Python-only; skip auto-generated code and non-Python
+# files in the project root.
+extend-exclude = [
+    "blog/migrations/*",
+    "Dockerfile",
+    "Caddyfile",
+    "docker-compose*.yml",
+    ".github",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
