@@ -1,4 +1,4 @@
-from django.db.models import Q
+from django.db.models import F, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from ninja import Router
 
@@ -103,11 +103,19 @@ def posts_by_tag(request, slug: str):
 @router.get("/posts/{post_id}", response=PostDetailOut)
 def get_post(request, post_id: int):
     post = get_object_or_404(
-        Post.objects.select_related("author").prefetch_related("tags", "comments__author"),
+        Post.objects.select_related("author").prefetch_related(
+            "tags",
+            Prefetch(
+                "comments",
+                queryset=Comment.objects.select_related("author").order_by("created_at"),
+            ),
+        ),
         id=post_id,
     )
-    # Fire-and-forget counter increment; single UPDATE, no row reload.
-    Post.objects.filter(id=post_id).update(view_count=post.view_count + 1)
+    # Atomic at the DB level: two concurrent reads of `post.view_count`
+    # can both be stale, but `F("view_count") + 1` becomes a single SQL
+    # expression that the database applies under the row's lock.
+    Post.objects.filter(id=post_id).update(view_count=F("view_count") + 1)
 
     comments = [
         {
