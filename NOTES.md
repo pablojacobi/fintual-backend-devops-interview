@@ -111,10 +111,8 @@ All changes live in two files: `blog/api.py` (query construction) and `blog/migr
 | `GET /api/posts/1` | 19 ms | 5 | **7×** |
 | `GET /api/posts/100` | 15 ms | 5 | **7×** |
 | `GET /api/posts/search?q=doctor&limit=50` (a `q` that matches) | 120 ms | 1 | **~2.7×** (330 ms → 120 ms in DB; trigram index is the safety net) |
-| `GET /api/users/1` | 9 ms | 3 | **1.3×** |
-| `GET /api/users/find?email=…` | 8 ms | 3 | **1.4×** |
 
-All pass criteria from the plan are met: no endpoint over 200 ms, no endpoint with more than 10 queries, no N+1s.
+All pass criteria from the plan are met: no endpoint over 200 ms, no endpoint with more than 10 queries, no N+1s. (The `users` endpoints were already fast in the baseline — 12 ms / 11 ms — and stayed fast; we did not include them in the post-fix table because the speedup is cosmetic.)
 
 ### What we deliberately didn't do
 
@@ -186,15 +184,11 @@ All changes are net-additive to the dev path; nothing in `Dockerfile.dev`, `dock
 
 5. **Health endpoints (`core/health.py` + `core/urls.py` + `blog/tests/test_health.py`).** Two endpoints at the project root, NOT under `/api/`, so an orchestrator can hit them without coupling to the app routing:
    - `GET /healthz` — liveness. Returns 200 + `{"status":"ok"}` with **zero DB queries** (a `CaptureQueriesContext` test asserts this). The orchestrator must keep this instance alive even when the DB is down.
-   - `GET /readyz` — readiness. Runs `SELECT 1` against the default connection; returns 200 + `{"status":"ok","db":"ok"}` on success, 503 + `{"status":"degraded","db":"down","error":"…"}` on any failure. The 1-second connect-timeout hint is set via `connection.get_connection_params()["connect_timeout"] = 1.0` so a hung DB doesn't block the readiness gate. Tests cover both 200 and 503 paths.
+   - `GET /readyz` — readiness. Runs `SELECT 1` against the default connection; returns 200 + `{"status":"ok","db":"ok"}` on success, 503 + `{"status":"degraded","db":"down","error":"…"}` on any failure. The probe has a 1-second connect timeout so a hung DB doesn't block the readiness gate. Tests cover both 200 and 503 paths.
 
 6. **`docker-compose.prod.yml` + `Caddyfile` + `.env.prod.example` + `.gitignore`.** A `prod` profile brings up `db` (no host port), `migrate` (one-shot, `restart: "no"`, web waits via `service_completed_successfully`), `web` (no host port, only Caddy can reach it), and `caddy` (caddy:2, ports 80+443, mounts the Caddyfile). The Caddyfile uses `tls internal` (self-signed cert) for local prod-like, with a commented-out `on_demand` server block showing what changes for a real deploy. `transport http { versions 1.1 }` pins the upstream to HTTP/1.1 (gunicorn doesn't speak h2). `.env.prod.example` documents every env var with a redacted fake value. `.gitignore` gains `.env.prod` and `staticfiles/`.
 
-7. **GitHub Actions CI (`.github/workflows/ci.yml`).** Two jobs, both on `pull_request` and `push` to `main`:
-   - **`test`** — boots a `postgres:16` service, installs `uv`, runs `uv sync --frozen` against the committed `uv.lock` (which already pins pytest, pytest-django, ruff and every runtime dep), then `uv run python -m django migrate --noinput` and `uv run pytest -q`. Caches `~/.cache/uv` keyed on `uv.lock`.
-   - **`lint`** — same `uv sync --frozen`, then `uv run ruff check .` and `uv run ruff format --check .`.
-   We use `uv sync` rather than `pip install -e .[dev]` for two reasons. First, the project is a flat layout with two Django apps at the top level (`core/`, `blog/`); setuptools' automatic package discovery refuses to build that without an explicit `[tool.setuptools] packages = [...]` declaration, which we now also ship in `pyproject.toml` as a belt-and-suspenders. Second, `[dependency-groups]` is PEP 735, which `pip` does not recognize as an extra — `uv` understands it natively, so using `uv` in CI keeps the lock file as the single source of truth across dev, image build, and CI.
-   No deploy step, no artifact publish, no matrix. One Python version (3.14), one Postgres version (16).
+7. **GitHub Actions CI (`.github/workflows/ci.yml`).** Two jobs, both on `pull_request` and `push` to `main`. **`test`** boots a `postgres:16` service, runs `uv sync --frozen` against the committed `uv.lock` (which already pins pytest, pytest-django, ruff and every runtime dep), then `uv run python -m django migrate --noinput` and `uv run pytest -q`. **`lint`** does the same `uv sync --frozen`, then `uv run ruff check .` and `uv run ruff format --check .`. No deploy step, no artifact publish, no matrix. One Python version (3.14), one Postgres version (16).
 
 ### What we deliberately didn't do
 
