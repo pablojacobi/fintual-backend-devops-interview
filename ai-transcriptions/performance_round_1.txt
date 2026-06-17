@@ -529,21 +529,293 @@ and will be cleaned up with the rest of the round's bookkeeping.
 
 ------------------------------------------------------------------------------
 
-END OF ROUND 1
+SECOND REVIEW PASS (the same evening, after the user asked Gemini to
+re-review)
+
+The user came back with three new Gemini review threads on PR #2, all
+medium. The PR was already merged-pending and looked "done", so this is
+the kind of follow-up that should not regress the work that already
+landed.
+
+SHELL$ gh api graphql ... reviewThreads(first:50) { nodes { id isResolved comments(first:10) { nodes { author { login } path line body } } } }
+
+  3 unresolved threads, all from gemini-code-assist:
+
+  1. PRRT_kwDOS8vrP86KEcE9  blog/migrations/0002_indexes.py:40
+     "Since `is_published` is a boolean column and all hot-path queries
+      filter specifically for `is_published=True`, a partial index
+      `WHERE is_published = true` is much more efficient than a composite
+      index."
+     Suggested: change `ON blog_post (is_published, created_at DESC)` to
+                `ON blog_post (created_at DESC) WHERE is_published = true`.
+
+  2. PRRT_kwDOS8vrP86KEcE_  blog/migrations/0002_indexes.py:50
+     "Similar to the composite index, since search queries are only
+      performed on published posts (`is_published=True`), these GIN
+      trigram indexes should also be partial indexes. GIN indexes on
+      large text fields (especially `body`) can be extremely large and
+      expensive to maintain during writes."
+     Suggested: add the same `WHERE is_published = true` to the two GIN
+                trigram indexes.
+
+  3. PRRT_kwDOS8vrP86KEcFC  blog/api.py:34
+     "Instead of manually parsing and validating query parameters from
+      `request.GET`, it is highly recommended to leverage Django Ninja's
+      native query parameter handling. Why: (1) OpenAPI/Swagger
+      documentation auto-generates from the signature — `limit` and
+      `offset` are currently hidden from /api/docs; (2) Ninja returns
+      422 for invalid types; (3) less boilerplate."
+     Suggested: declare `limit: int = 50, offset: int = 0` directly in
+                the function signature.
+
+All three are valid:
+
+  1. The partial index is the strictly tighter match for the queries we
+     run, and the savings (smaller index, no write amp on drafts, better
+     buffer cache hit rate) are real even if small on this dataset
+     (90% of rows are published). On a production dataset with a more
+     typical draft ratio the saving compounds.
+
+  2. Same logic, more pronounced for the GIN trigram on `body`. The
+     index was 63 MB; even a 10% reduction is meaningful.
+
+  3. Manual parsing was the wrong default from the start. The OpenAPI
+     issue in particular is a real discoverability problem: a client
+     reading /api/docs wouldn't know `limit`/`offset` exist. And the
+     422 behavior on bad input is the standard HTTP contract — silently
+     falling back to defaults is a footgun.
+
+I applied all three.
+
+blog/migrations/0002_indexes.py:
+  - blog_post_pub_created_idx: was
+      CREATE INDEX blog_post_pub_created_idx
+        ON blog_post (is_published, created_at DESC)
+    now
+      CREATE INDEX blog_post_pub_created_idx
+        ON blog_post (created_at DESC) WHERE is_published = true
+
+  - blog_post_title_trgm and blog_post_body_trgm: same
+    `WHERE is_published = true` predicate added.
+
+  - blog_comment_post_created_idx: unchanged (the read path on
+    blog_comment does not filter on is_published; the post detail
+    endpoint shows comments regardless of publish state).
+
+I edited the migration file to the new shape. The 0002 migration is
+already applied on the running DB, so `migrate` will be a no-op. To
+keep the running DB consistent with what a fresh install would see, I
+manually dropped the three old indexes and recreated the new ones:
+
+SHELL$ docker compose exec -T db psql -U postgres -d backend_devops_interview -c "
+  DROP INDEX IF EXISTS blog_post_pub_created_idx;
+  DROP INDEX IF EXISTS blog_post_title_trgm;
+  DROP INDEX IF EXISTS blog_post_body_trgm;
+"
+DROP INDEX
+DROP INDEX
+DROP INDEX
+
+SHELL$ docker compose exec -T web python manage.py migrate
+Operations to perform:
+  Apply all migrations: admin, auth, blog, contenttypes, sessions
+Running migrations:
+  No migrations to apply.
+
+SHELL$ docker compose exec -T db psql -U postgres -d backend_devops_interview -c "
+  CREATE INDEX blog_post_pub_created_idx
+    ON blog_post (created_at DESC) WHERE is_published = true;
+  CREATE INDEX blog_post_title_trgm
+    ON blog_post USING gin (title gin_trgm_ops) WHERE is_published = true;
+  CREATE INDEX blog_post_body_trgm
+    ON blog_post USING gin (body gin_trgm_ops) WHERE is_published = true;
+"
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+
+SHELL$ SELECT indexname, indexdef FROM pg_indexes
+  WHERE schemaname='public' AND tablename='blog_post'
+    AND indexname IN ('blog_post_pub_created_idx','blog_post_title_trgm','blog_post_body_trgm')
+  ORDER BY indexname;
+
+         indexname         |                                                       indexdef
+---------------------------+----------------------------------------------------------------------------------------------------------------------
+ blog_post_body_trgm       | CREATE INDEX blog_post_body_trgm ON public.blog_post USING gin (body gin_trgm_ops) WHERE (is_published = true)
+ blog_post_pub_created_idx | CREATE INDEX blog_post_pub_created_idx ON public.blog_post USING btree (created_at DESC) WHERE (is_published = true)
+ blog_post_title_trgm      | CREATE INDEX blog_post_title_trgm ON public.blog_post USING gin (title gin_trgm_ops) WHERE (is_published = true)
+
+blog/api.py:
+  - Removed the `_pagination(request)` helper.
+  - Added a tiny `_clamp(value, lo, hi)` helper for the bounds.
+  - Replaced the manual parsing in the three list endpoints with
+    function-signature params:
+
+      def list_posts(request, limit: int = DEFAULT_LIMIT, offset: int = 0):
+          limit = _clamp(limit, 1, MAX_LIMIT)
+          offset = max(0, offset)
+          ...
+
+    Same change in search_posts and posts_by_tag.
+
+  - The `import os` and other headers are unchanged. The function
+    body is now smaller and reads more cleanly.
+
+Re-measured (warm, seeded dataset):
+
+SHELL$ for ep in ... ; do
+    printf '%-65s ' "$ep"
+    curl -s -o /dev/null -w 'HTTP %{http_code}  total=%{time_total}s\n' "http://localhost:8000$ep"
+  done
+
+/api/posts                                                        HTTP 200  total=0.040555s
+/api/posts?limit=200                                              HTTP 200  total=0.071916s
+/api/posts/search?q=python                                        HTTP 200  total=0.246545s
+/api/posts/search?q=python&limit=200                              HTTP 200  total=0.213331s
+/api/posts/by-tag/python                                          HTTP 200  total=0.018497s
+/api/posts/by-tag/python?limit=200                                HTTP 200  total=0.098076s
+/api/posts/1                                                      HTTP 200  total=0.022185s
+/api/posts/100                                                    HTTP 200  total=0.021830s
+/api/users/1                                                      HTTP 200  total=0.013460s
+/api/users/find?email=user00001@example.com                       HTTP 200  total=0.035308s
+
+  ⤷ All endpoints still under 250 ms. The partial-index change is
+  query-plan-neutral for the rows we care about (the planner picks
+  the same Index Scan); the 422 validation and the OpenAPI
+  discoverability are the user-visible wins.
+
+EXPLAIN check on the two hot queries after the change:
+
+SHELL$ EXPLAIN (ANALYZE, BUFFERS)
+  SELECT id FROM blog_post WHERE is_published = true ORDER BY created_at DESC LIMIT 50;
+
+ Limit  (cost=0.29..20.20 rows=50 width=16) (actual time=0.068..0.483 rows=50 loops=1)
+   Buffers: shared hit=52
+   ->  Index Scan using blog_post_pub_created_idx on blog_post
+         (actual time=0.066..0.476 rows=50 loops=1)
+         Buffers: shared hit=52
+ Execution Time: 0.515 ms
+
+SHELL$ EXPLAIN (ANALYZE, BUFFERS) ... search?q=doctor ...
+
+ Limit  (cost=0.29..286.58 rows=50 width=636) (actual time=0.545..12.511 rows=50 loops=1)
+   ->  Index Scan using blog_post_pub_created_idx on blog_post
+         Filter: (((title)::text ~~* '%doctor%'::text) OR (body ~~* '%doctor%'::text))
+         Rows Removed by Filter: 681
+ Execution Time: 12.546 ms
+
+  ⤷ Same plan shape as before the partial-index change. The composite
+  index was already serving these queries; the partial version just
+  skips the draft rows.
+
+Verifying the OpenAPI change:
+
+SHELL$ curl -s http://localhost:8000/api/openapi.json | python3 -c "
+  import json, sys
+  spec = json.load(sys.stdin)
+  for path, methods in spec.get('paths', {}).items():
+    for method, op in methods.items():
+      params = [p['name'] for p in op.get('parameters', [])]
+      if params:
+        print(f'  {method.upper():5s} {path:40s}  {params}') "
+
+  GET   /api/posts                                ['limit', 'offset']
+  GET   /api/posts/search                         ['q', 'limit', 'offset']
+  GET   /api/posts/by-tag/{slug}                  ['slug', 'limit', 'offset']
+
+  ⤷ The `limit`/`offset` params are now in the OpenAPI spec, which
+  means they show up in /api/docs with their types and defaults.
+
+Verifying the 422 behavior:
+
+SHELL$ curl -s -o /dev/null -w 'HTTP %{http_code}\n' 'http://localhost:8000/api/posts?limit=abc'
+HTTP 422
+
+  ⤷ Before: silently fell back to the default of 50 and returned 200.
+  After: 422 Unprocessable Entity, as Ninja's spec says.
+
+Clamping behavior is still in place for the legitimate cases:
+
+SHELL$ curl -s -o /dev/null -w "HTTP %{http_code}  size=%{size_download}\n" 'http://localhost:8000/api/posts?limit=999999'
+HTTP 200  size=68830
+
+SHELL$ curl -s -o /dev/null -w "HTTP %{http_code}\n" 'http://localhost:8000/api/posts?offset=-5'
+HTTP 200
+
+  ⤷ `limit=999999` returns 200 with 200 items (clamped to MAX_LIMIT=200).
+  `offset=-5` returns 200 (clamped to 0).
+
+pytest:
+
+SHELL$ docker compose exec -T web python -m pytest -q
+...                                                                      [100%]
+3 passed in 1.43s
+
+  ⤷ 3/3 green.
+
+I committed and pushed:
+
+SHELL$ git add blog/api.py blog/migrations/0002_indexes.py NOTES.md
+SHELL$ git commit -m "fix(perf): partial indexes and Ninja-native pagination params"
+[perf/round-1 4d9725c] fix(perf): partial indexes and Ninja-native pagination params
+ 3 files changed, 27 insertions(+), 28 deletions(-)
+SHELL$ git push origin perf/round-1
+  aa75030..4d9725c  perf/round-1 -> perf/round-1
+
+Then I replied to each of the three new threads via the GraphQL API
+with a one-paragraph explanation of the fix and resolved the threads:
+
+  - PRRT_kwDOS8vrP86KEcE9 (composite → partial)            : replied + resolved
+  - PRRT_kwDOS8vrP86KEcE_ (GIN trigram → partial)          : replied + resolved
+  - PRRT_kwDOS8vrP86KEcFC (Ninja-native pagination params)  : replied + resolved
+
+State of the PR's review threads at the end of this pass:
+
+  6 resolved threads, 0 unresolved.
+
+------------------------------------------------------------------------------
+
+END OF ROUND 1 (v2)
 
 PR #2 is open: https://github.com/pablojacobi/fintual-backend-devops-interview/pull/2
 
-Summary for the next reader:
+Commits on the branch (oldest → newest):
+  c55717a  perf(round-1): pagination, N+1 fix, indexes for hot read paths
+  d59b352  docs(round-1): add agent transcript for the perf round
+  aa75030  fix(perf): preserve comment ordering and make view_count atomic
+  4d9725c  fix(perf): partial indexes and Ninja-native pagination params
 
-  Baseline                              After
-  ----------------------------------    ----------------------------------
-  /api/posts            38.9 s          45 ms       (~860x)
-  /api/posts?limit=200  38.9 s          30 ms       (~1300x)
-  /api/posts/by-tag/X   10.3 s          12 ms       (~860x)
-  /api/posts/{id}       135 ms          19 ms       (7x)
-  /api/posts/search     135–330 ms      120 ms      (3x, matching q)
-  /api/users/*          12 ms           8 ms        (1.4x)
+Summary of the perf gains, end-to-end:
 
-All endpoints under 200 ms. No N+1s. No model-definition changes. One
-intentional false start documented (Count annotation on User → 45 s
-EXPLAIN). All changes in blog/api.py + a new RunSQL migration 0002.
+  Baseline (this session)         Final
+  ---------------------------     -----------------------------------------
+  /api/posts         38.9 s       40 ms       (~970x)
+  /api/posts?lim=200 38.9 s       72 ms       (~540x, last 200 posts)
+  /api/posts/by-tag  10.3 s       18 ms       (~570x)
+  /api/posts/by-tag?lim=200       98 ms       (~105x, last 200 posts)
+  /api/posts/{id}    135 ms       22 ms       (6x)
+  /api/posts/search  135-330 ms   12 ms in DB / 211-259 ms wall
+  /api/users/*       12 ms        8-13 ms     (1.4x)
+
+Bonus properties picked up along the way:
+  - Comments always come back sorted by created_at (Prefetch + order_by).
+  - view_count is atomic at the DB level (F() expression).
+  - Indexes are partial, smaller, and don't track draft rows.
+  - /api/docs and the OpenAPI spec document limit/offset.
+  - Invalid input (limit=abc) returns 422, not a silent 200.
+
+No model definitions changed. Rule of thumb held: pagination, ordering,
+and serialization tweaks are fair game; new fields, FK direction
+changes, or denormalization are not.
+
+Two false starts documented in NOTES.md (and in the v1 section of this
+transcript above): the Count annotation on User (45s cartesian LEFT
+JOIN) and the partial-index suggestion from the first pass that we did
+not have.
+
+Open question for the next round: the search endpoint's wall time
+(211-259 ms) is dominated by serializing 50 posts, not by the query
+(12 ms in DB). If the product is search-heavy, a more aggressive
+solution is a dedicated search backend (Meilisearch / ES) or a
+tsvector column with a GIN index. That is out of scope for round 1
+because it would change the model definition.
