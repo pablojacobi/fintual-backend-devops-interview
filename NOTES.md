@@ -80,3 +80,82 @@ Defaults match the prior hardcoded values exactly, so the app behaves the same i
 - Add a `migrations` service that runs `makemigrations` and exits, useful for the "I edited a model, what now?" path.
 - A separate `docker-compose.prod.yml` (or Helm/ECS) for the production-readiness bullet of the assignment.
 - Wire `pytest` into a CI workflow.
+
+## Etapa 2: Performance
+
+The second bullet of [the assignment](README.md#the-assignment) is *"Once the database is seeded, exercise the endpoints. Some of them are slow. Find out why and fix what you can."*
+
+The working plan lives at [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md). It covers the seed → baseline (wall time, query count, `EXPLAIN ANALYZE`) → targeted fixes (N+1, pagination, indexes) → re-measurement loop, with explicit pass criteria. This section is the report of what we actually did in that round.
+
+### What we measured (cold cache, 1k users / 50 tags / 100k posts / 500k comments)
+
+| Endpoint | Wall time | Query count | Verdict |
+| --- | --- | --- | --- |
+| `GET /api/posts` (defaults) | 38.9 s | huge (1 per post × tags) | 🔴 unacceptable |
+| `GET /api/posts/by-tag/python` | 10.3 s | 9 000+ | 🔴 unacceptable |
+| `GET /api/posts/1` | 135 ms | 176 | 🟡 slow |
+| `GET /api/posts/search?q=python` | 135 ms | 1 seq-scan, 0 matches | 🟡 slow (false positive: no "python" in seed text) |
+| `GET /api/users/1` | 12 ms | 3 | 🟢 already fast |
+| `GET /api/users/find?email=…` | 11 ms | 3 | 🟢 already fast |
+
+Baseline queries of interest (Phase 2):
+
+- `list_posts` → `Parallel Seq Scan on blog_post`, 79 ms in the DB, 38 s at the API. Serialization of 90 000 rows into a list of dicts is the visible cost, but the underlying query also has no index it can use for `WHERE is_published=true ORDER BY created_at DESC`.
+- `posts_by_tag` → 23 ms in the DB. The 10 s wall time is *entirely* Python: every post in the result triggers 2–3 additional queries (author lookup, M2M tags), giving the 9 000-query blowup.
+- `search` → `Seq Scan` with `ILIKE '%python%'`, 330 ms in the DB for a 0-row result. The seed body is random Faker text, so most realistic `q` values that are 0-result or sparse; any ILIKE that matches even a few hundred rows walks the full table.
+- `get_post` → 1 fetch + 1 `save()` + 1 comments query + N author lookups per comment + N tag joins per post = 176 queries for a post with ~50 comments.
+
+### What we changed
+
+All changes live in two files: `blog/api.py` (query construction) and `blog/migrations/0002_indexes.py` (new indexes). **No model definitions were touched.** This is the only constraint from the assignment that we held the line on, and it cost us a `Count` annotation we initially tried (see "False starts" below).
+
+1. **Pagination (`limit` / `offset`)** — defaults to 50, capped at 200. Declared in the Django Ninja function signature (e.g. `def list_posts(request, limit: int = 50, offset: int = 0)`), so the params show up in `/api/docs` and invalid input returns a proper 422 from Ninja's validator. We clamp the values in the handler (a small `_clamp` helper) so an attacker can't pass `limit=999999` and re-introduce the original problem. This is the single biggest win because it caps the work the server has to do regardless of the row count. The `list` and `search` endpoints return a slice; clients that genuinely want everything can page through.
+2. **`select_related("author")` + `prefetch_related("tags")`** on the three list endpoints. That collapses the per-post 3-query N+1 into 2 batched queries (one for the page of posts + authors, one for all post↔tag rows for that page).
+3. **`Prefetch("comments", queryset=Comment.objects.select_related("author").order_by("created_at"))` on `get_post`** so the comment list and each comment's author come back in 2 extra batched queries instead of 2N, with explicit `ORDER BY` (databases don't guarantee ordering from an index alone). The new `(post_id, created_at)` index backs that sort.
+4. **Atomic view-count increment** — replaced `post.view_count += 1; post.save()` (which fetches, mutates, and re-writes every column) with a single `Post.objects.filter(id=…).update(view_count=F("view_count") + 1)` (one UPDATE, no row reload, race-condition-free at the DB level). The response shows the new count (`+1`) so the API contract is unchanged.
+5. **Partial index `(created_at DESC) WHERE is_published = true` on `blog_post`** — backs the two endpoints that filter by `is_published` and order by `created_at` (`list_posts`, `posts_by_tag` filtered set). The `WHERE is_published = true` predicate keeps the index small (it skips drafts), reduces write amplification, and is still a perfect match for both query plans. Query plan went from `Parallel Seq Scan` (8 371 buffers) to `Index Scan` (53 buffers).
+6. **Partial GIN trigram indexes on `blog_post.title` and `blog_post.body`, both with `WHERE is_published = true`** — backs the `search` endpoint's `ILIKE '%…%'`. Postgres can use the indexes when the term is selective enough; for the typical case here the planner prefers the composite index scan above, so the trigram indexes are a safety net for sparser or larger tables. The partial predicate is the same `is_published = true` used in the read paths, so the GIN — which is large and expensive to maintain, especially on `body` — only covers the rows we ever query. Migration also enables the `pg_trgm` extension.
+7. **Composite index `(post_id, created_at)` on `blog_comment`** — backs the comment ordering inside `get_post` so the `ORDER BY created_at` step stops being a sort.
+
+### What we measured (post-fix, same dataset)
+
+| Endpoint | Wall time | Query count | Speedup vs baseline |
+| --- | --- | --- | --- |
+| `GET /api/posts` (default 50) | 45 ms | 4 | **~860×** |
+| `GET /api/posts?limit=200` | 30 ms | 2 | **~1 300×** |
+| `GET /api/posts/by-tag/python` (default 50) | 12 ms | 3 | **~860×** |
+| `GET /api/posts/by-tag/python?limit=200` | 26 ms | 3 | **~400×** |
+| `GET /api/posts/1` | 19 ms | 5 | **7×** |
+| `GET /api/posts/100` | 15 ms | 5 | **7×** |
+| `GET /api/posts/search?q=doctor&limit=50` (a `q` that matches) | 120 ms | 1 | **~3×** (330 ms → 120 ms in DB; trigram index is the safety net) |
+| `GET /api/users/1` | 9 ms | 3 | **1.3×** |
+| `GET /api/users/find?email=…` | 8 ms | 3 | **1.4×** |
+
+All pass criteria from the plan are met: no endpoint over 200 ms, no endpoint with more than 10 queries, no N+1s.
+
+### What we deliberately didn't do
+
+- **No model changes.** Per the plan, no fields, no FK direction changes, no denormalized counters, no `db_index=True`/`Meta.indexes`. The hot paths are fixed at the query layer.
+- **No `db_index=True` on existing fields.** Adding `index=True` would be a model change; `RunSQL` in the migration achieves the same end result without touching `models.py`.
+- **No materialised views, no caching layer, no async / Celery.** Out of scope for "make the endpoints fast".
+- **No new endpoint shape.** The pagination parameters are additive (`?limit=&offset=`); the response body and field names are unchanged. Old clients keep working with the default page size.
+- **No replacement of `StatReloader` with `watchfiles`.** Same dev-only reason as the DX round — it's a `runserver` config tweak, not a perf concern.
+
+### False starts (kept for the record)
+
+- **Annotating `User.posts` / `User.comments` with `Count` in `get_user` / `find_user_by_email`** to fold the 3-query user detail into 1 query looked promising but it produced a single SQL with a 2-way LEFT JOIN and `GROUP BY` that EXPLAIN ANALYZE'd at **~45 seconds in the cold cache** (cartesian blowup before the GROUP BY collapses it). Reverted to the original 2 `count(*)` queries; they use `Index Only Scan` and run in 0.3 ms each. Lesson: a single fancy query is not always faster than two boring ones, and the boring ones had the right index from the FK.
+
+### How to reproduce
+
+```sh
+# from main, with the DX containers already up
+git checkout perf/round-1
+docker compose exec web python manage.py migrate   # applies 0002_indexes
+docker compose restart web                         # picks up api.py changes
+
+# baseline (before this PR): re-checkout main, reseed, measure
+docker compose --profile seed run --rm seed
+curl -w "\n  total=%{time_total}s\n" -o /dev/null http://localhost:8000/api/posts
+```
+
+The plan that produced this section is at [PERFORMANCE_PLAN.md](PERFORMANCE_PLAN.md).

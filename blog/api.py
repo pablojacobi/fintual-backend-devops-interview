@@ -1,4 +1,4 @@
-from django.db.models import Q
+from django.db.models import F, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from ninja import Router
 
@@ -14,6 +14,13 @@ from blog.schemas import (
 )
 
 router = Router()
+
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 200
+
+
+def _clamp(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(value, hi))
 
 
 def _serialize_author(user: User) -> dict:
@@ -40,32 +47,67 @@ def _serialize_post_list(post: Post) -> dict:
 
 
 @router.get("/posts", response=list[PostListOut])
-def list_posts(request):
-    posts = Post.objects.filter(is_published=True).order_by("-created_at")
+def list_posts(request, limit: int = DEFAULT_LIMIT, offset: int = 0):
+    limit = _clamp(limit, 1, MAX_LIMIT)
+    offset = max(0, offset)
+    posts = (
+        Post.objects
+        .select_related("author")
+        .prefetch_related("tags")
+        .filter(is_published=True)
+        .order_by("-created_at")[offset:offset + limit]
+    )
     return [_serialize_post_list(p) for p in posts]
 
 
 @router.get("/posts/search", response=list[PostListOut])
-def search_posts(request, q: str):
-    posts = Post.objects.filter(
-        Q(title__icontains=q) | Q(body__icontains=q),
-        is_published=True,
-    ).order_by("-created_at")
+def search_posts(request, q: str, limit: int = DEFAULT_LIMIT, offset: int = 0):
+    limit = _clamp(limit, 1, MAX_LIMIT)
+    offset = max(0, offset)
+    posts = (
+        Post.objects
+        .select_related("author")
+        .prefetch_related("tags")
+        .filter(
+            Q(title__icontains=q) | Q(body__icontains=q),
+            is_published=True,
+        )
+        .order_by("-created_at")[offset:offset + limit]
+    )
     return [_serialize_post_list(p) for p in posts]
 
 
 @router.get("/posts/by-tag/{slug}", response=list[PostListOut])
-def posts_by_tag(request, slug: str):
+def posts_by_tag(request, slug: str, limit: int = DEFAULT_LIMIT, offset: int = 0):
     tag = get_object_or_404(Tag, slug=slug)
-    posts = tag.posts.filter(is_published=True).order_by("-created_at")
+    limit = _clamp(limit, 1, MAX_LIMIT)
+    offset = max(0, offset)
+    posts = (
+        tag.posts
+        .select_related("author")
+        .prefetch_related("tags")
+        .filter(is_published=True)
+        .order_by("-created_at")[offset:offset + limit]
+    )
     return [_serialize_post_list(p) for p in posts]
 
 
 @router.get("/posts/{post_id}", response=PostDetailOut)
 def get_post(request, post_id: int):
-    post = get_object_or_404(Post, id=post_id)
-    post.view_count += 1
-    post.save()
+    post = get_object_or_404(
+        Post.objects.select_related("author").prefetch_related(
+            "tags",
+            Prefetch(
+                "comments",
+                queryset=Comment.objects.select_related("author").order_by("created_at"),
+            ),
+        ),
+        id=post_id,
+    )
+    # Atomic at the DB level: two concurrent reads of `post.view_count`
+    # can both be stale, but `F("view_count") + 1` becomes a single SQL
+    # expression that the database applies under the row's lock.
+    Post.objects.filter(id=post_id).update(view_count=F("view_count") + 1)
 
     comments = [
         {
@@ -74,7 +116,7 @@ def get_post(request, post_id: int):
             "body": c.body,
             "created_at": c.created_at,
         }
-        for c in post.comments.order_by("created_at")
+        for c in post.comments.all()
     ]
     return {
         "id": post.id,
@@ -83,7 +125,7 @@ def get_post(request, post_id: int):
         "author": _serialize_author(post.author),
         "tags": [_serialize_tag(t) for t in post.tags.all()],
         "comments": comments,
-        "view_count": post.view_count,
+        "view_count": post.view_count + 1,
         "created_at": post.created_at,
         "updated_at": post.updated_at,
     }
@@ -124,6 +166,9 @@ def get_user(request, user_id: int):
 
 
 def _user_detail(user: User) -> dict:
+    # Two `count(*)` queries with `Index Only Scan` (one on blog_post,
+    # one on blog_comment) beat a single `Count` annotation: the latter
+    # forces a JOIN that is O(posts * comments) for the matched user.
     return {
         "id": user.id,
         "username": user.username,
